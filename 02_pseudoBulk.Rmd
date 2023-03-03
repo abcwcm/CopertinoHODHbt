@@ -1,0 +1,1702 @@
+---
+title: "Comparing gene expression within HPCA-inferred cell populations"
+author: "Friederike Dündar"
+date: "2022-06-09; updated `r Sys.Date()`"
+output:
+    html_document:
+        toc: true
+        toc_float: true
+        toc_depth: 6
+        code_folding: hide
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE, cache.lazy = FALSE)
+```
+
+```{r libraries, cache=FALSE, message=FALSE, warning=FALSE}
+library(SingleCellExperiment); library(magrittr)
+library(data.table)
+#library(kableExtra)
+library(ggplot2); theme_set(theme_bw(base_size = 16))
+library(patchwork)
+library(DESeq2)
+library(DEGreport)
+source("/Users/frd2007/Documents/Projects/2019-05_BradJones/2022-04_Denis_scRNAseq/brad-jones_scrnaseqdenis/R/helper_pseudoBulkResults.R")
+```
+
+```{r setting_up_the_data}
+data_dir <- "/Users/frd2007/Documents/Projects/2019-05_BradJones/2022-04_Denis_scRNAseq/data/"
+sce <- readRDS(paste0(data_dir, "sce_Dennis_sampleIntegration_2022-05-03_noCounts.rds"))
+
+## work on colData ----------------------------------
+sce$treatment <- gsub(".+_", "", sce$Sample)
+sce$patient <- gsub("_.+", "", sce$Sample)
+rownames(sce) <- scater::uniquifyFeatureNames(rowData(sce)$ID, rowData(sce)$Symbol)
+sce$labPredict_HPCA <- ifelse(is.na(sce$labPredict_HPCA), "no.label",sce$labPredict_HPCA)
+```
+
+```{r defining_color_schemes}
+## define color schemes ------------------------------
+sample_cols <- c("lightpink1","indianred1","hotpink3", 
+    "yellow","olivedrab1","springgreen2",
+    paste0("navajowhite",c(1,3,4)))
+names(sample_cols) <- sort(unique(sce$Sample))
+
+treatment_cols <- c("DMSO"="grey85","IL15"="gold1", "IL15HOD"="orangered3")
+
+patient_cols <- c("darkslategray1","darkslategray3","darkslategrey")
+names(patient_cols) <- unique(sce$patient)
+
+cluster_cols = ABCutilities:::fx.get_palette_ABC("paired_pal")[1:length(unique(sce$cluster_k50))]
+names(cluster_cols) <- sort(unique(sce$cluster_k50))
+
+cell_cols <- c("B" = "yellow1", "CD4.CD69" = "maroon4", "CD4.noCCR7" = "tan1", "CD4.TCF7"="tomato2",
+    "CD8" = "thistle2", "Monocytes" = "lightseagreen", "NK.CCL5"="lightsteelblue1", "NK.XCL1"="mediumblue")
+```
+```{r}
+cell_cols2 <- c("B_cell" = "yellow1", "T_cells" = "red2",
+    "Monocyte" = "lightseagreen", "NK_cells"="dodgerblue1", "DC" = "antiquewhite3")
+```
+```{r wrapper_function_patternDetection, message=FALSE, warning=FALSE, eval=FALSE}
+
+#' @param summed_filt_object SCE object with pseudo-bulk-summed counts
+#' @param cells_of_interest string indicating the name of the cell types of interest,
+#' e.g. "DC" -- should be an element of whatever is used for `subset_by`, i.e.
+#' summed_filt_object$subset_by should contain `cells_of_interest` as a label.
+#' @param pseudobulk_result list of DE assessments done with the pseudobulk routine
+#' @param file_name If given, the DEGpattern results will be saved to disk; otherwise
+#' returned to the environment
+run_DEG_patterns <- function(summed_filt_object = summed.filt,
+    cells_of_interest = coi,
+    subset_by = "labPredict_HPCA",
+    pseudobulk_result = de.treat_HPCA,
+    file_name = NULL){
+    
+    subsce <- summed_filt_object[, !is.na(summed_filt_object[[subset_by]]) &
+            summed_filt_object[[subset_by]] == cells_of_interest]
+    cmat <- DESeq2::vst(counts(subsce)) %>% as.data.frame
+    colnames(cmat) <- subsce$Sample
+    ## focus on DEG
+    print("get deg")
+    genes_of_interest <- rownames(subset(pseudobulk_result[[cells_of_interest]], FDR <= 0.05))
+    cmat <- cmat[genes_of_interest,]
+    metadf <-  as.data.frame(colData(subsce)[,c("Sample","treatment","patient",subset_by,"ncells","sizeFactor")])
+    rownames(metadf) <- metadf$Sample
+    metadf$treatment <- as.factor(metadf$treatment) ## needed for the grouping
+    
+    cls <- degPatterns(as.matrix(cmat),
+    metadata = metadf, 
+    time="treatment",#"group", 
+    col=NULL, plot=FALSE, reduce=FALSE)
+    
+    if(!is.null(file_name)){
+        saveRDS(cls, file=file_name)
+    }else{
+        return(cls)
+    }
+}
+```
+
+
+--> given that CD4 and CD8 T cells are so intermingled, we should just go with the HPCA-SingleR labels.
+Those labels are: T cells, B cells, Monocytes, DCs, NK cells.
+
+```{r pseudo_bulk_on_server_HPCALabels, eval=FALSE}
+### Using HPCA labels instead of our own=============================================
+# $ conda activate r4_env
+options(menu.graphics=FALSE)
+library(SingleCellExperiment)
+setwd("/scratchLocal/frd2007/2022-04_Dennis/2022-05-05_pseudoBulk/")
+sce <- readRDS("sce_Dennis_sampleIntegration_2022-05-03.rds")
+
+sce$treatment <- gsub(".+_", "", sce$Sample)
+sce$patient <- gsub("_.+", "", sce$Sample)
+rownames(sce) <- scater::uniquifyFeatureNames(rowData(sce)$ID, rowData(sce)$Symbol)
+
+sce <-  sce[, sce$labPredict_HPCA %in% c("T_cells", "NK_cell","Monocyte","B_cell"  , "DC" )]
+
+
+## pseudo-bulk summation------------------------------
+library(edgeR);library(scran);library(scater)
+## Using 'labPredict_HPCA' and 'Sample' as our two factors; each column of the output
+## corresponds to one unique combination of these two factors.
+summed <- aggregateAcrossCells(sce, id=colData(sce)[,c("labPredict_HPCA", "Sample", "patient","treatment")])
+#> summed
+# class: SingleCellExperiment 
+# dim: 22266 45 
+# metadata(0):
+# assays(1): counts
+# rownames(22266): MIR1302-2HG AL627309.1 ... AC240274.1 K03455
+# rowData names(2): ID Symbol
+# colnames: NULL
+# colData names(29): cell Sample ... treatment ncells
+# reducedDimNames(2): UMAP PCA_corr
+# mainExpName: NULL
+# altExpNames(0):
+
+
+## Removing all pseudo-bulk samples with 'insufficient' cells.
+summed.filt <- summed[,summed$ncells >= 10]
+
+## do the actual testing: any changes in comparison to DMSO=====================
+#library(scran)
+## DEG between any of the treatments: coef=4:5
+de.treat_HPCA <- pseudoBulkDGE(summed.filt, 
+    label=summed.filt$labPredict_HPCA,
+    design=~patient+treatment,
+    coef=4:5,
+    condition=summed.filt$treatment 
+)
+
+## Number of DEGs -----------------
+# alpha cutoff = 0.05
+is.de_treat_HPCA <- decideTestsPerLabel(de.treat_HPCA, threshold=0.05)
+##!save(is.de_treat_HPCA, de.treat_HPCA, file = "DE_pseudoBulk_DMSO-vs-IL15-vs-IL15HOD_HPCALabels.rda")
+
+# summarizeTestsPerLabel(is.de_treat_HPCA)
+#            0    1    NA
+#B_cell   6700   99 15467
+#DC       3908  987 17371
+#Monocyte 6183 2110 13973
+#NK_cell  6016 3963 12287
+#T_cells  6631 4961 10674
+
+sizeFactors(summed.filt) <- NULL
+summed.filt <- logNormCounts(summed.filt)
+##!saveRDS(summed.filt, file = "sce_summedFilt_HPCALabels_2022-06-08.rds")
+
+############################################################
+### IL15Hod vs IL15 ========================================
+de.combi_HPCA <- pseudoBulkDGE(summed.filt, 
+    label=summed.filt$labPredict_HPCA,
+    design=~patient+treatment,
+    contrast = c(0,0,0,-1,1), # there are five columns in the design matrix
+    condition=summed.filt$treatment 
+)
+
+## Number of DEGs;  alpha cutoff = 0.05
+is.de_combi_HPCA <- decideTestsPerLabel(de.combi_HPCA, threshold=0.05)
+# >  summarizeTestsPerLabel(is.de_combi_HPCA)
+#          -1     0   1    NA
+#B_cell     0  6799   0 15467
+#DC        29  4765 101 17371
+#Monocyte 277  7624 392 13973
+#NK_cell   61  9732 186 12287
+#T_cells  785 10094 713 10674
+
+##!save(is.de_treat_HPCA, de.treat_HPCA,is.de_combi_HPCA,de.combi_HPCA, file = "DE_pseudoBulk_DMSO-vs-IL15-vs-IL15HOD_HPCALabels.rda")
+```
+
+```{r load_data,cache=FALSE}
+load(paste0(data_dir, "DE_pseudoBulk_DMSO-vs-IL15-vs-IL15HOD_HPCALabels.rda")) # is.de_treat_HPCA, de.treat_HPCA,is.de_combi_HPCA,de.combi_HPCA
+summed.filt <- readRDS(paste0(data_dir, "sce_summedFilt_HPCALabels_2022-06-08.rds"))
+```
+
+```{r DEGpattern_for_all, eval=FALSE}
+### DEGpatterns #########################################################
+## this wrapper function takes the output of the pseudobulk DE tests and 
+## saves the output of DEGpatterns to disk, which can then be loaded
+for(CELL in c("B_cell","DC","Monocyte","NK_cell", "T_cells" )){
+    print(CELL)
+    run_DEG_patterns(summed_filt_object = summed.filt, cells_of_interest = CELL,
+        pseudobulk_result = de.treat_HPCA,
+        file_name = paste0(data_dir, "degPatterns_HPCAlabels_", CELL, ".rds"))
+}
+```
+
+
+## Genes that change in response to treatment
+
+Where treatment entails IL15-only and IL15+HODHbt.
+I.e. the resulting DEGs are those that change in *either* treatment condition compared to DMSO.
+
+```{r}
+is.de_df <- data.frame(is.de_treat_HPCA, check.names = F)
+```
+
+```{r fig.width=7}
+summarizeTestsPerLabel(is.de_treat_HPCA) %>% as.data.table(., keep.rownames="cell") %>% 
+    ggplot(., aes(x = cell, y = `1`)) + geom_bar(stat="identity") +
+    coord_flip() + 
+    ylab("Number of DEG") + xlab("cell type") +
+    theme(panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank()) +
+    ggtitle("Number of DEGs when comparing the treatments against each other", subtitle = "Using HPCA-inferred cell labels")
+```
+
+### DEG results
+
+#### T cells
+
+```{r eval=T}
+coi= "T_cells"
+#cat("\n\n###",label, "\n\n")
+deg = row.names(is.de_df[c(which(is.de_df[,coi] > 0), which(is.de_df[,coi] <0)), ])
+
+deg <- de.treat_HPCA[[coi]] %>% as.data.frame() %>% as.data.table(., keep.rownames="gene")
+deg <- deg[(!is.na(logFC.treatmentIL15HOD) | !is.na(logFC.treatmentIL15)) & FDR <=0.05]
+deg$FDRlogFClogCPM <- (deg$logCPM * max(c(abs(deg$logFC.treatmentIL15),abs(deg$logFC.treatmentIL15HOD))))  + -10*log10(deg$FDR)
+setorder(deg,-FDRlogFClogCPM)
+```
+
+Top DEGs based on a combi of FDR and average expression:
+
+```{r results='asis'}
+head(deg) %>% as.data.frame %>% ABCutilities::my_table(.)
+```
+
+
+```{r fig.width=9, fig.height = 8}
+subset(de.treat_HPCA[[coi]], FDR <= 0.05) %>%
+    as.data.frame %>%
+    ggplot(., aes(x=logFC.treatmentIL15, 
+        y=logFC.treatmentIL15HOD, color=logCPM)) + 
+     geom_point(size=.5, shape=1, alpha=.5) + 
+     geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+     scale_color_viridis_c(direction =-1, option = "inferno") +
+    ggtitle(paste(coi, "DEG directions of change"))
+```
+
+Some selected genes based on their log-fold-changes:
+
+```{r Tcells_deg_individualExpression, fig.width=15, fig.height=40}
+goi <- deg[abs(logFC.treatmentIL15HOD) > 3|abs(logFC.treatmentIL15) >3 & FDR <= 0.01]$gene
+scater::plotExpression(summed.filt[,coi==summed.filt$labPredict_HPCA], 
+               features=goi, 
+               x="treatment", colour_by="patient", shape_by = "patient",
+               other_fields="treatment", ncol=4, scales="free") +
+    ggtitle(paste("Highest logFC-DEGs for", coi),
+        subtitle="Comparing DMSO vs. IL15 vs. IL15+HOD")
+```
+
+##### Heatmaps
+
+```{r hm_deg_Tcells, fig.height = 10}
+goi <- head(deg$gene, n = 40)
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","CCR7",goi)),
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","CCR7"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=10,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CCR7 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nDMSO vs. IL15 vs.IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","CCR7",goi)),
+     cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","CCR7"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=8,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CCR7 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nDMSO vs. IL15|IL+HODHbt"))
+```
+
+- lots of proteasome-related genes (PSMB)
+- TCF7 is down following the non-DMSO treatment
+- there are some genes that seem to highlight specific subpopulations, let's have a closer look:
+
+```{r fig.width = 20, fig.height= 16}
+pl <- lapply(c("PFN1","ACTB","GZMA","FTH1","LTB"), function(i){
+    p1 <- scABC2::plot_reducedDim_from_sce(sce, which_reddim = "UMAP",
+    alpha = .5, size = .7, exprs_values = "logcounts",
+    color_by = i,
+    set_color=FALSE, add_cell_info = c("Sample","treatment")) +
+    scale_color_viridis_c(direction =-1, option = "inferno") +
+    #theme(legend.position = "none") + 
+        facet_wrap(~Sample) +
+    ggtitle( i)
+    return(p1)
+})
+ABCutilities::MultiPlotList(pl, cols = 3)
+```
+
+- ACTB, PFN1, GZMA seem to somewhat anticorrelated with CCR7 expression
+
+##### Patterns
+
+```{r degPatterns_Tcells, fig.width=10, fig.height = 12, warning=FALSE}
+clusters <- readRDS(file=paste0(data_dir, "degPatterns_HPCAlabels_",coi, ".rds"))
+degPlotCluster(clusters$normalized, time = "treatment", 
+    color = "treatment", 
+    min_genes = 25)+
+    geom_line(aes(group=genes), alpha=0.05)+
+    theme_classic(base_size=12)   +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scale_color_manual(values=treatment_cols) +
+    ggtitle(paste("DEG of", coi))
+```
+
+
+#### NK cells
+
+```{r eval=T}
+coi= "NK_cell"
+#cat("\n\n###",label, "\n\n")
+deg = row.names(is.de_df[c(which(is.de_df[,coi] > 0), which(is.de_df[,coi] <0)), ])
+
+deg <- de.treat_HPCA[[coi]] %>% as.data.frame() %>% as.data.table(., keep.rownames="gene")
+deg <- deg[(!is.na(logFC.treatmentIL15HOD) | !is.na(logFC.treatmentIL15)) & FDR <=0.05]
+deg$FDRlogFClogCPM <- (deg$logCPM * max(c(abs(deg$logFC.treatmentIL15),abs(deg$logFC.treatmentIL15HOD))))  + -10*log10(deg$FDR)
+setorder(deg,-FDRlogFClogCPM)
+```
+
+Top DEGs based on a combi of FDR and average expression:
+
+```{r results='asis'}
+head(deg) %>% as.data.frame %>% ABCutilities::my_table(.)
+```
+
+
+```{r fig.width=9, fig.height = 8}
+subset(de.treat_HPCA[[coi]], FDR <= 0.05) %>%
+    as.data.frame %>%
+    ggplot(., aes(x=logFC.treatmentIL15, 
+        y=logFC.treatmentIL15HOD, color=logCPM)) + 
+     geom_point(size=.5, shape=1, alpha=.5) + 
+     geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+     scale_color_viridis_c(direction =-1, option = "inferno") +
+    ggtitle(paste(coi, "DEG directions of change"))
+```
+
+Some selected genes based on logFC alone:
+
+```{r NKcells_deg_individualExpression, fig.width=15, fig.height=40}
+goi <- deg[(abs(logFC.treatmentIL15HOD) > 3.5|abs(logFC.treatmentIL15) >3.5) & FDR <= 0.05]$gene
+scater::plotExpression(summed.filt[,coi==summed.filt$labPredict_HPCA], 
+               features=goi, 
+               x="treatment", colour_by="patient", shape_by = "patient",
+               other_fields="treatment", ncol=4, scales="free") +
+     ggtitle(paste("Highest logFC-DEGs for", coi),
+        subtitle="Comparing DMSO vs. IL15 vs. IL15+HOD")
+```
+
+##### Heatmaps
+
+```{r hm_deg_NKcells, fig.height = 11}
+goi <- head(deg$gene, n = 40)
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","NKG7","KIR2DL4",goi)),
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","NKG7","KIR2DL4"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=10,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        #cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        #cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        NKG7 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        KIR2DL4 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nDMSO vs. IL15 vs.IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","NKG7","KIR2DL4",goi)),
+     cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","NKG7","KIR2DL4"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=8,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+      #  cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+       # cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+       CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        NKG7 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        KIR2DL4 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nDMSO vs. IL15|IL+HODHbt"))
+```
+
+GBPs are consistently up following IL15 and IL15+HODHbt
+
+Again, there are some genes that seem to come up primarily in subpopulations:
+
+```{r fig.width = 20, fig.height= 9}
+pl <- lapply(c("CCL3","IFITM3","CCL4"), function(i){
+    p1 <- scABC2::plot_reducedDim_from_sce(sce, which_reddim = "UMAP",
+    alpha = .5, size = .7, exprs_values = "logcounts",
+    color_by = i,
+    set_color=FALSE, add_cell_info = c("Sample","treatment")) +
+    scale_color_viridis_c(direction =-1, option = "inferno") +
+    #theme(legend.position = "none") + 
+        facet_wrap(~Sample) +
+    ggtitle( i)
+    return(p1)
+})
+ABCutilities::MultiPlotList(pl, cols = 3)
+```
+
+##### Patterns
+
+
+```{r degPatterns_NKcells, fig.width=10, fig.height = 12, warning=FALSE, message=FALSE}
+clusters <- readRDS(file=paste0(data_dir, "degPatterns_HPCAlabels_",coi, ".rds"))
+degPlotCluster(clusters$normalized, time = "treatment", 
+    color = "treatment", 
+    min_genes = 25)+
+    geom_line(aes(group=genes), alpha=0.05)+
+    theme_classic(base_size=12)   +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scale_color_manual(values=treatment_cols) +
+    ggtitle(paste("DEG of", coi))
+```
+
+
+#### Monocytes
+
+```{r eval=T, fig.width=9, fig.height = 8}
+coi= "Monocyte"
+#cat("\n\n###",label, "\n\n")
+deg = row.names(is.de_df[c(which(is.de_df[,coi] > 0), which(is.de_df[,coi] <0)), ])
+
+deg <- de.treat_HPCA[[coi]] %>% as.data.frame() %>% as.data.table(., keep.rownames="gene")
+deg <- deg[(!is.na(logFC.treatmentIL15HOD) | !is.na(logFC.treatmentIL15)) & FDR <=0.05]
+deg$FDRlogFClogCPM <- (deg$logCPM * max(c(abs(deg$logFC.treatmentIL15),abs(deg$logFC.treatmentIL15HOD))))  + -10*log10(deg$FDR)
+setorder(deg,-FDRlogFClogCPM)
+```
+
+Top DEGs based on a combi of FDR and average expression:
+
+```{r results='asis'}
+head(deg) %>% as.data.frame %>% ABCutilities::my_table(.)
+```
+
+```{r fig.width=9, fig.height = 8}
+subset(de.treat_HPCA[[coi]], FDR <= 0.05) %>%
+    as.data.frame %>%
+    ggplot(., aes(x=logFC.treatmentIL15, 
+        y=logFC.treatmentIL15HOD, color=logCPM)) + 
+     geom_point(size=.5, shape=1, alpha=.5) + 
+     geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+     scale_color_viridis_c(direction =-1, option = "inferno") +
+    ggtitle(paste(coi, "DEG directions of change"))
+```
+
+```{r mono_deg_individualExpression, fig.width=15, fig.height=40}
+goi <- deg[(abs(logFC.treatmentIL15HOD) > 3.75|abs(logFC.treatmentIL15) >3.75) & FDR <= 0.05]$gene
+scater::plotExpression(summed.filt[,coi==summed.filt$labPredict_HPCA], 
+               features=goi, 
+               x="treatment", colour_by="patient", shape_by = "patient",
+               other_fields="treatment", ncol=4, scales="free") +
+     ggtitle(paste("Highest logFC-DEGs for", coi),
+        subtitle="Comparing DMSO vs. IL15 vs. IL15+HOD")
+```
+
+##### Heatmaps
+
+```{r hm_deg_mono_hpca, fig.height = 11}
+goi <- head(deg$gene, n=40)
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","LYZ",goi)),
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","LYZ"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=10,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+       # cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+         LYZ = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nDMSO vs. IL15 vs.IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","LYZ",goi)),
+     cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", col_palette = c("medium"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    gns_as_cellAnnotation = c("CD4","CD8A","LYZ"),
+    fontsize_row=8,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+      #  cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+       # cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        LYZ = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nDMSO vs. IL15|IL+HODHbt"))
+```
+
+##### Patterns
+
+
+```{r degPatterns_Monocytes, fig.width=10, fig.height = 12, warning=FALSE, message=FALSE}
+clusters <- readRDS(file=paste0(data_dir, "degPatterns_HPCAlabels_",coi, ".rds"))
+degPlotCluster(clusters$normalized, time = "treatment", 
+    color = "treatment", 
+    min_genes = 25)+
+    geom_line(aes(group=genes), alpha=0.05)+
+    theme_classic(base_size=12)   +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scale_color_manual(values=treatment_cols) +
+    ggtitle(paste("DEG of", coi))
+```
+
+#### DC
+
+```{r eval=T, fig.width=9, fig.height = 8}
+coi= "DC"
+#cat("\n\n###",label, "\n\n")
+deg = row.names(is.de_df[c(which(is.de_df[,coi] > 0), which(is.de_df[,coi] <0)), ])
+
+deg <- de.treat_HPCA[[coi]] %>% as.data.frame() %>% as.data.table(., keep.rownames="gene")
+deg <- deg[(!is.na(logFC.treatmentIL15HOD) | !is.na(logFC.treatmentIL15)) & FDR <=0.05]
+deg$FDRlogFClogCPM <- (deg$logCPM * max(c(abs(deg$logFC.treatmentIL15),abs(deg$logFC.treatmentIL15HOD))))  + -10*log10(deg$FDR)
+setorder(deg,-FDRlogFClogCPM)
+```
+
+Top DEGs based on a combi of FDR and average expression:
+
+```{r results='asis'}
+head(deg) %>% as.data.frame %>% ABCutilities::my_table(.)
+```
+
+
+```{r fig.width=9, fig.height = 8}
+subset(de.treat_HPCA[[coi]], FDR <= 0.05) %>%
+    as.data.frame %>%
+    ggplot(., aes(x=logFC.treatmentIL15, 
+        y=logFC.treatmentIL15HOD, color=logCPM)) + 
+     geom_point(size=.5, shape=1, alpha=.5) + 
+     geom_hline(yintercept = 0) + geom_vline(xintercept = 0) +
+     scale_color_viridis_c(direction =-1, option = "inferno") +
+    ggtitle(paste(coi, "DEG directions of change"))
+```
+
+```{r DC_deg_individualExpression, fig.width=15, fig.height=40}
+goi <- deg[(abs(logFC.treatmentIL15HOD) > 3.75|abs(logFC.treatmentIL15) >3.75) & FDR <= 0.05]$gene
+scater::plotExpression(summed.filt[,coi==summed.filt$labPredict_HPCA], 
+               features=goi, 
+               x="treatment", colour_by="patient", shape_by = "patient",
+               other_fields="treatment", ncol=4, scales="free") +
+    ggtitle(paste("Highest logFC-DEGs for", coi),
+        subtitle="Comparing DMSO vs. IL15 vs. IL15+HOD")
+```
+
+##### Heatmaps
+
+```{r hm_deg_dc_hpca, fig.height = 11}
+goi <- head(deg$gene, n = 40)
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","FCER1A",goi)),
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","FCER1A"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=10,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        FCER1A = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nDMSO vs. IL15 vs.IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","FCER1A",goi)),
+     cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","FCER1A"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=10,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+      CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        FCER1A = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nDMSO vs. IL15|IL+HODHbt"))
+```
+
+Some genes with subpopulation-specific patterns:
+
+```{r fig.width = 27, fig.height= 9}
+pl <- lapply(c("CCL8","CXCL10","CTSL", "C1QB"), function(i){
+    p1 <- scABC2::plot_reducedDim_from_sce(sce, which_reddim = "UMAP",
+    alpha = .5, size = .7, exprs_values = "logcounts",
+    color_by = i,
+    set_color=FALSE, add_cell_info = c("Sample","treatment")) +
+    scale_color_viridis_c(direction =-1, option = "inferno") +
+    #theme(legend.position = "none") + 
+        facet_wrap(~Sample) +
+    ggtitle( i)
+    return(p1)
+})
+ABCutilities::MultiPlotList(pl, cols = 4)
+```
+
+##### Patterns
+
+
+```{r degPatterns_DC , fig.width=10, fig.height = 12, warning=FALSE, message=FALSE}
+clusters <- readRDS(file=paste0(data_dir, "degPatterns_HPCAlabels_",coi, ".rds"))
+degPlotCluster(clusters$normalized, time = "treatment", 
+    color = "treatment", 
+    min_genes = 25)+
+    geom_line(aes(group=genes), alpha=0.05)+
+    theme_classic(base_size=12)   +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+    scale_color_manual(values=treatment_cols) +
+    ggtitle(paste("DEG of", coi))
+```
+
+#### Heatmap of all DEG across all cell types
+
+```{r}
+## get the top DEG from each cell type's comparison
+goi <- lapply(de.treat_HPCA, function(x){
+    dt <- as.data.table(as.data.frame(x), keep.rownames="gene")
+    dt <- dt[FDR <= 0.05]
+    dt$FDRlogFClogCPM <- (dt$logCPM * abs(dt$logFC.treatmentIL15))  + -10*log10(dt$FDR)
+    setorder(dt,-FDRlogFClogCPM)
+    gn <- head(dt$gene,n=10)
+    dt$FDRlogFClogCPM <- (dt$logCPM * abs(dt$logFC.treatmentIL15HOD))  + -10*log10(dt$FDR)
+    setorder(dt,-FDRlogFClogCPM)
+    gn <- head(dt$gene,n=10)
+    return(unique(gn))
+}) %>% unlist %>% unique
+```
+
+```{r eval=FALSE}
+markers.l <- lapply(de.treat_HPCA, function(x){
+    dt <- as.data.frame(x)
+    dt <- subset(dt, FDR <= 0.05)
+    dt$gene <- rownames(dt)
+    return(dt)})
+names(markers.l) <- paste0(names(markers.l), "_all3Treats")
+openxlsx::write.xlsx(markers.l,  file = ##!paste0(data_dir,"marker_gene_lists/DEG_all3Treats_HPCALabels_2022-06.xlsx"))
+```
+
+```{r hm_allCellType_DEG_HPCAlabs, fig.height = 12, fig.width = 10}
+scABC2::plot_marker_heatmap(sce,
+    gns = goi,
+    cells = colnames(sce[,!is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA %in% c("T_cells", "NK_cell","Monocyte","B_cell"  , "DC" )]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=8,
+    add_cell_annotation = data.frame(
+        row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment,
+        patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+       # cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols),
+    main = paste("Top DEG across all HPCA labels \nDMSO vs. IL15 vs.IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = goi,
+    cells = colnames(sce[,!is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA %in% c("T_cells", "NK_cell","Monocyte","B_cell"  , "DC" )]),
+    sort_cells_by = "labPredict_HPCA", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=8,
+    add_cell_annotation = data.frame(
+        row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment,
+        patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+     #   cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols),
+    main = paste("Top DEG across all HPCA labels \nDMSO vs. IL15 vs.IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = goi,
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA %in% c("T_cells", "NK_cell","Monocyte","B_cell"  , "DC" )]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=8,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+     #   cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols),
+        #CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        #CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+       main = paste("Top DEG across all HPCA cell labels \nDMSO vs. IL15 vs.IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = goi,
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA %in% c("T_cells", "NK_cell","Monocyte","B_cell"  , "DC" )]),
+    sort_cells_by = "labPredict_HPCA", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=8,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+     #   cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols),
+        #CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        #CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+       main = paste("Top DEG across all HPCA cell labels \nDMSO vs. IL15 vs.IL+HODHbt"))
+```
+
+
+## Genes that change when comparing the combi treatment vs. IL15 alone
+
+The resulting DEGs are those that change when comparing the IL15+HODHbt condition to IL15 directly.
+
+```{r}
+is.de_df <- data.frame(is.de_combi_HPCA, check.names = F)
+```
+
+```{r fig.width = 7}
+summarizeTestsPerLabel(is.de_combi_HPCA) %>% 
+    as.data.table(., keep.rownames="cell") %>% 
+    ggplot(., aes(x = cell, y = `1`)) + geom_bar(stat="identity") +
+    coord_flip() + 
+    ylab("Number of DEG") + xlab("cell type") +
+    theme(panel.grid.major.y = element_blank(), panel.grid.minor.y = element_blank()) +
+    ggtitle("Number of DEGs when comparing the IL15+HODHbt vs. IL15", subtitle = "Using HPCA-inferred cell labels")
+```
+
+### DEG results
+
+#### T cells
+
+```{r eval=T}
+coi= "T_cells"
+#cat("\n\n###",label, "\n\n")
+deg = row.names(is.de_df[c(which(is.de_df[,coi] > 0), which(is.de_df[,coi] <0)), ])
+
+deg <- de.combi_HPCA[[coi]] %>% as.data.frame() %>% as.data.table(., keep.rownames="gene")
+deg <- deg[!is.na(logFC) & FDR <=0.05]
+setorder(deg, PValue, FDR, -logFC)
+```
+
+Top DEGs based on logFC:
+
+```{r results='asis'}
+head(deg) %>% as.data.frame %>% ABCutilities::my_table(.)
+```
+
+
+```{r Tcells_deg2_individualExpression, fig.width=15, fig.height=12}
+goi <- deg[abs(logFC) > 3 & FDR <= 0.05]$gene %>% sort
+scater::plotExpression(summed.filt[,coi==summed.filt$labPredict_HPCA], 
+               features=goi, 
+               x="treatment", colour_by="patient", shape_by = "patient",
+               other_fields="treatment", ncol=4, scales="free") +
+    ggtitle(paste("Top DEGs for", coi),
+        subtitle="Comparing  IL15+HOD vs. IL15")
+```
+
+##### Heatmaps
+
+```{r hm_deg2_Tcells, fig.height = 9}
+goi <- head(deg$gene, n = 15)
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","CCR7",goi)),
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","CCR7"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=18,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CCR7 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nIL15 vs.IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","CCR7",goi)),
+     cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","CCR7"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=8,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CCR7 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nIL15 vs. IL+HODHbt"))
+```
+
+
+#### NK cells
+
+```{r eval=T, fig.width=9, fig.height = 8}
+coi= "NK_cell"
+#cat("\n\n###",label, "\n\n")
+deg = row.names(is.de_df[c(which(is.de_df[,coi] > 0), which(is.de_df[,coi] <0)), ])
+
+deg <- de.combi_HPCA[[coi]] %>% as.data.frame() %>% as.data.table(., keep.rownames="gene")
+deg <- deg[!is.na(logFC) & FDR <=0.05]
+setorder(deg, PValue, FDR, -logFC)
+```
+
+Top DEGs based on logFC:
+
+```{r results='asis'}
+head(deg) %>% as.data.frame %>% ABCutilities::my_table(.)
+```
+
+
+```{r NKcells_deg2_individualExpression, fig.width=15, fig.height=15}
+goi <- deg[abs(logFC) > 1.4 & FDR <= 0.05]$gene %>% sort
+scater::plotExpression(summed.filt[,coi==summed.filt$labPredict_HPCA], 
+               features=goi, 
+               x="treatment", colour_by="patient", shape_by = "patient",
+               other_fields="treatment", ncol=4, scales="free") +
+    ggtitle(paste("Top DEGs for", coi),
+        subtitle="Comparing IL15 vs. IL15+HOD")
+```
+
+##### Heatmaps
+
+```{r hm_deg2_NKcells, fig.height = 9, fig.width = 7}
+goi <- head(deg$gene, n = 15)
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","NKG7","KIR2DL4",goi)),
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","NKG7","KIR2DL4"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=18,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        #cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        #cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        NKG7 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        KIR2DL4 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nIL15 vs. IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","NKG7","KIR2DL4",goi)),
+     cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","NKG7","KIR2DL4"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=8,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+      #  cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+       # cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+       CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        NKG7 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        KIR2DL4 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nIL15 vs. IL+HODHbt"))
+```
+
+#### Monocytes
+
+```{r eval=T, fig.width=9, fig.height = 8}
+coi= "Monocyte"
+#cat("\n\n###",label, "\n\n")
+deg = row.names(is.de_df[c(which(is.de_df[,coi] > 0), which(is.de_df[,coi] <0)), ])
+
+deg <- de.combi_HPCA[[coi]] %>% as.data.frame() %>% as.data.table(., keep.rownames="gene")
+deg <- deg[!is.na(logFC) & FDR <=0.05]
+setorder(deg, PValue, FDR, -logFC)
+```
+
+Top DEGs based on logFC:
+
+```{r results='asis'}
+head(deg) %>% as.data.frame %>% ABCutilities::my_table(.)
+```
+
+
+```{r mono_deg2_individualExpression, fig.width=15, fig.height=15}
+goi <- deg[(abs(logFC) >3.25) & FDR <= 0.05]$gene %>% sort
+scater::plotExpression(summed.filt[,coi==summed.filt$labPredict_HPCA], 
+               features=goi, 
+               x="treatment", colour_by="patient", shape_by = "patient",
+               other_fields="treatment", ncol=4, scales="free") +
+    ggtitle(paste("Top DEGs for", coi),
+        subtitle="Comparing IL15 vs. IL15+HOD")
+```
+
+##### Heatmaps
+
+```{r hm_deg2_mono_hpca, fig.height = 8}
+goi <- head(deg$gene, n = 15)
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","LYZ",goi)),
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","LYZ"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=18,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+       # cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+         LYZ = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nIL15 vs. IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","LYZ",goi)),
+     cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", col_palette = c("medium"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    gns_as_cellAnnotation = c("CD4","CD8A","LYZ"),
+    fontsize_row=18,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+      #  cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+       # cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        LYZ = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nIL15 vs. IL+HODHbt"))
+```
+
+
+#### DC
+
+```{r eval=T, fig.width=9, fig.height = 8}
+coi= "DC"
+#cat("\n\n###",label, "\n\n")
+deg = row.names(is.de_df[c(which(is.de_df[,coi] > 0), which(is.de_df[,coi] <0)), ])
+
+deg <- de.combi_HPCA[[coi]] %>% as.data.frame() %>% as.data.table(., keep.rownames="gene")
+deg <- deg[!is.na(logFC) & FDR <=0.05]
+setorder(deg, PValue, FDR, -logFC)
+```
+
+Top DEGs based on logFC:
+
+```{r results='asis'}
+head(deg) %>% as.data.frame %>% ABCutilities::my_table(.)
+```
+
+```{r DC_deg2_individualExpression, fig.width=15, fig.height=10}
+goi <- deg[abs(logFC) > 3 & FDR <= 0.05]$gene %>% sort
+scater::plotExpression(summed.filt[,coi==summed.filt$labPredict_HPCA], 
+               features=goi, 
+               x="treatment", colour_by="patient", shape_by = "patient",
+               other_fields="treatment", ncol=4, scales="free") +
+    ggtitle(paste("Top DEGs for", coi),
+        subtitle="Comparing IL15 vs. IL15+HOD")
+```
+
+##### Heatmaps
+
+```{r hm_deg2_dc_hpca, fig.height = 9}
+goi <- head(deg$gene, n = 15)
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","FCER1A",goi)),
+    cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    scale="row", n_quant_breaks = 300,col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","FCER1A"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=18,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+        CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        FCER1A = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nIL15 vs. IL+HODHbt"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","FCER1A",goi)),
+     cells = colnames(sce[, !is.na(sce$labPredict_HPCA) & sce$labPredict_HPCA  == coi]),
+    sort_cells_by = "treatment", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","FCER1A"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=18,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = sce$labPredict_HPCA,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+        treatment = treatment_cols,
+        cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+      CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        FCER1A = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top DEG for", coi,"\nIL15 vs. IL+HODHbt"))
+```
+
+## What does HODHbt add?
+
+```{r}
+ll2 <- lapply(names(de.combi_HPCA), function(i){
+    out <- as.data.frame(de.combi_HPCA[[i]]) %>% 
+        subset(., !is.na(logFC) & FDR <= 0.05) %>% 
+        as.data.table(., keep.rownames = "gene")
+    out$cellType <- i
+    out$comparison <- "IL15vsIL15HOD"
+    return(out)
+}) %>% rbindlist
+ll1 <- lapply(names(de.treat_HPCA), function(i){
+    out <- as.data.frame(de.treat_HPCA[[i]]) %>% 
+        subset(., !is.na(logFC.treatmentIL15) & FDR <= 0.05) %>% 
+        as.data.table(., keep.rownames = "gene")
+    out$cellType <- i
+    setnames(out, "logFC.treatmentIL15", "logFC")
+    out$logFC.treatmentIL15HOD <- NULL
+    out$comparison <- "IL15vsDMSO"
+    out$cellType <- i
+    return(out)
+}) %>% rbindlist
+
+ll <- rbindlist(list(ll1, ll2))
+
+comp_cols <- treatment_cols[c("IL15","IL15HOD")]
+names(comp_cols) <- c("IL15vsDMSO", "IL15vsIL15HOD")
+```
+```{r}
+ggplot(ll, aes(x = comparison, fill = cellType)) + geom_bar(position = position_dodge()) +
+    theme(panel.grid.major.x = element_blank()) +
+    scale_fill_manual(values = cell_cols2) +
+    ylab("number of DEG")
+```
+```{r}
+ggplot(ll, aes(fill = comparison, x = cellType)) + 
+    geom_bar(position = position_dodge()) +
+    theme(panel.grid.major.x = element_blank()) +
+    scale_fill_manual(values = comp_cols) +
+    ylab("number of DEG") 
+
+```
+
+IL15 alone leads to profound changes in gene expression.
+The addition of HODHbt leads to fewer DEGs when compared to the IL15 treatment.
+The largest effect in terms of DEG numbers for HODHbt can be seen for T cells.
+
+```{r fig.width = 15}
+ggplot(ll[logFC>0], aes(x = comparison, y = logFC, color = comparison)) + ggbeeswarm::geom_quasirandom(shape=1, alpha = .6) +
+    facet_grid(~cellType) + coord_flip() +
+    scale_color_manual(values=comp_cols) +
+    theme(panel.grid.major.y = element_blank(), legend.position = "none") +
+    ggtitle("Positive logFC")
+```
+
+Genes with logFC > 5:
+
+```{r results='asis'}
+ll[logFC>5, c("comparison","cellType","gene","logFC","FDR"), with=FALSE] %>%
+    as.data.frame %>% ABCutilities::my_table(.)
+```
+
+
+```{r fig.width = 15}
+ggplot(ll[logFC<0], aes(x = comparison, y = logFC, color = comparison)) + ggbeeswarm::geom_quasirandom(shape=1, alpha = .6) +
+    facet_grid(~cellType) + coord_flip() +
+    scale_color_manual(values=comp_cols) +
+    theme(panel.grid.major.y = element_blank(), legend.position = "none") +
+    ggtitle("Negative logFC")
+```
+
+Genes with logFC < -2.75:
+
+```{r results='asis'}
+ll[logFC < -2.75, c("comparison","cellType","gene","logFC","FDR"), with=FALSE] %>%
+    as.data.frame %>% ABCutilities::my_table(.)
+```
+
+- EDAR and NOG, while interesting genes, are not particularly abundant
+- We need to have plots that also show the abundance
+
+```{r fig.width=6, fig.height = 9}
+ggplot(ll, aes(y = logFC, x = logCPM, color = -10*log10(FDR))) + geom_point(shape=1, size = .75, alpha = .5) +
+    facet_grid(cellType~comparison) +
+    theme(legend.position = "bottom") +
+    scale_color_viridis_c(direction = -1) +
+    ggtitle("DEG results of the 2 comparisons")
+```
+
+The range of logFC is smaller for HODHbt than for IL15.
+
+## MILO Neighborhoods -- cells that change in abundance when comparing IL15+HOD vs. IL15
+
+```{r loading_MILO_results, cache=TRUE}
+dd <- readRDS("/Users/frd2007/Documents/Projects/2019-05_BradJones/2022-04_Denis_scRNAseq/2022-05-18_MILO/milo_NHoods_IL15-vs-IL15HOD_2022-05-31.rds")
+names(dd)[1] <- "cell"
+sce <- scABC2::.add_colData(sce, to_add = dd, merge_on = "cell")
+sce$Nhood.Group <- ifelse(is.na(sce$Nhood.Group), "none", sce$Nhood.Group)
+sce$Nhood.Group.unique <- ifelse(grepl("\\.", sce$Nhood.Group), "multipleNhoods", sce$Nhood.Group)
+
+## identify cells that are part of the signChanging Nhoods
+load("/Users/frd2007/Documents/Projects/2019-05_BradJones/2022-04_Denis_scRNAseq/2022-05-18_MILO/milo_DAtestResults_treatment_IL15-vs-IL15HOD_2022-05-31.rda")# da_results
+changedNH <-  subset(da_results, FDR < 0.01)$NhoodGroup %>% unique %>% sort
+
+nn <- unique(as.character(sce$Nhood.Group))
+nni <- nn[unlist(lapply(strsplit(x = nn, split = "\\."), function(x) any(x %in% changedNH))) ]
+coi <- colnames(sce[, as.character(sce$Nhood.Group) %in% nni])
+
+sce$NhoodGroupSigChange <- ifelse(colnames(sce) %in% coi, TRUE, FALSE)
+sce$Nhood.Group.sigChange <- ifelse(sce$NhoodGroupSigChange == TRUE,
+    sce$Nhood.Group.unique, "n.s.")
+sce$Nhood.Group.sigChange <- factor(sce$Nhood.Group.sigChange,
+    levels = c("n.s.","multipleNhoods", changedNH), ordered = TRUE)
+```
+
+```{r fig.width = 18.5, fig.height = 9.5}
+pl <- lapply(changedNH, function(i){
+    p1 <- scABC2::plot_reducedDim_from_sce(sce, which_reddim = "UMAP",
+    alpha = .5, size = .7,
+    color_by = list(title=paste("NHood", i),
+        result = ifelse(as.character(sce$Nhood.Group.sigChange) == i, TRUE, FALSE)
+        ),
+        set_color=FALSE, add_cell_info = c("Sample","treatment")) +
+    scale_color_manual(values = c("grey95", "red1")) +
+    theme(legend.position = "none") + #facet_grid(~Sample) +
+    ggtitle(paste("NHood Group", i))
+    return(p1)
+})
+ABCutilities::MultiPlotList(pl, cols = 7)
+```
+
+1,3,4,5,6,7,8 = T cell Nhoods --> 7/8 of the significantly changing Nhoods are T cell-associated, only Nhood 2 represents the monocytes
+
+```{r fig.width = 4.5}
+dittoSeq::dittoBarPlot(sce, group.by = "Nhood.Group.sigChange", var = "cluster_k50",
+    color.panel = cluster_cols)
+```
+
+Most of the neighborhoods seem to have good overlaps with individuak k50-clusters.
+
+```{r fig.width=4.55}
+dittoSeq::dittoBarPlot(sce, var = "Nhood.Group.sigChange", group.by = "cluster_k50")
+```
+
+* Nhood 7 & 8 = cluster 1
+* cluster 8: Nhoods 4 & 6
+* Nhood 3 = cluster 2
+* Nhood 7 = cluster 1
+
+
+```{r fig.height = 6.5, fig.width = 6.5}
+dittoSeq::dittoBoxPlot(sce, split.by = "Nhood.Group.sigChange", var = "CD69", 
+    group.by = "treatment", jitter.size = .2, boxplot.lineweight = .2)
+```
+
+```{r fig.width = 3.5}
+dittoSeq::dittoBarPlot(sce, var = "Nhood.Group.sigChange",
+    group.by = "treatment") +
+    ggtitle("Fraction of cells per Nhood group")
+```
+
+* Nhood 5 = IL15 (not HODHbt!)
+* Nhood 6 = IL15+HODHbt
+
+Let's identify genes that
+
+- distinguish the different Nhoods associated with T cell clusters,
+- when only looking at IL15 and IL15HOD-treated cells
+- that are compared to the other Nhoods associated with T cell clusters:
+
+```{r Nhood_marker_genes}
+## cells treated with IL15/IL15HOD & among the T cell clusters
+scnhood <- sce[, sce$treatment != "DMSO" & !(as.character(sce$Nhood.Group.sigChange) %in% c("multipleNhoods","2"))]
+
+nhood_marks <- scran::findMarkers(scnhood, direction = "up", 
+    group = as.character(scnhood$Nhood.Group.sigChange), block = scnhood$patient)
+##!saveRDS(nhood_marks, file = paste0(data_dir,"markerGenes_MILONhoods_2022-06.rds"))
+nhood_marks.dt <- scABC2::extract_markers(scnhood, marker_search_result = nhood_marks,FDR_thresh = 0.01, rank_thresh = 10)
+```
+
+```{r fig.height = 10, fig.width = 10}
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","CD69",nhood_marks.dt[classify == "unique"]$gene_symbol)),
+     cells = colnames(scnhood[, scnhood$labPredict_HPCA %in% c("T_cells","Monocyte","NK_cell","B_cell","DC")]),
+    sort_cells_by = "Nhood.Group.sigChange", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    scale="row", col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","CD69"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=10,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = as.character(sce$labPredict_HPCA),
+        Nhood = sce$Nhood.Group.sigChange,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+       treatment = treatment_cols,
+     #   cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+      CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD69 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top markers for Nhoods that change abundance in IL15HOD vs. IL15\nand are associated with T/NK cells"))
+
+scABC2::plot_marker_heatmap(sce,
+    gns = unique(c("CD4","CD8A","CD69",nhood_marks.dt[classify == "unique"]$gene_symbol)),
+     cells = colnames(scnhood[, scnhood$labPredict_HPCA %in% c("T_cells","Monocyte","NK_cell","B_cell","DC")]),
+    sort_cells_by = "Nhood.Group.sigChange", 
+    cluster_cells_within_sortGroup = TRUE,
+    n_quant_breaks = 300,
+    #scale="row", 
+    #col_palette = c("mediumorchid","black","yellow"),
+    gns_as_cellAnnotation = c("CD4","CD8A","CD69"),
+    show_HKgenes = 'both',exprs_values = "logcounts",
+    fontsize_row=10,
+    add_cell_annotation = data.frame(row.names = colnames(sce), 
+        cell = as.character(sce$labPredict_HPCA),
+        Nhood = sce$Nhood.Group.sigChange,
+        Sample = sce$Sample,
+        treatment = sce$treatment, patient = sce$patient),
+    define_anno_cols = list(
+       treatment = treatment_cols,
+     #   cell = cell_cols2, 
+        patient = patient_cols,
+        Sample = sample_cols,
+      CD4 = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD8A = scales::brewer_pal("seq", "Purples")(5)[1:4],
+        CD69 = scales::brewer_pal("seq", "Purples")(5)[1:4]),
+    main = paste("Top markers for Nhoods that change abundance in IL15HOD vs. IL15\nand are associated with T/NK cells"))
+```
+
+
+Note that cells without IL15 (= DMSO-treated cells) aren't shown in the heatmaps above.
+
+## GO term enrichments
+
+In order to identify GO terms that are associated with specific gene lists, we need to select which gene lists should be compared to each other.
+Then, each of those gene lists can be tested for enrichments for the 3 classes of GO terms: Biological Processes (BP), Molecular Functions (MF), and Cellular Components (CC).
+These tests will be carried out for each cell type separately, first comparing the lists obtained via the DEGpattern groups shown above, and second for those genes that are up (or down) when comparing ILHOD vs. IL15 specifically.
+
+### All 3 conditions
+
+Here, we are splitting by the DEGpattern groups as shown above (e.g. genes that go up in both treatments vs genes that go up in one, down in the other etc. -- see the boxplots above)
+
+```{r eval=FALSE}
+## DEGpatterns modifies the gene names
+all.entrez$symbol <- make.names(all.entrez$SYMBOL)
+```
+```{r clusterProfiler_on_DEGpatternGroups, eval=FALSE}
+cpres2 <- list()
+
+for(COI in c("T_cells","Monocyte","DC","NK_cell")){
+    cl <- readRDS(file=paste0(data_dir, "degPatterns_HPCAlabels_",COI, ".rds"))
+    
+    cmp_list <- lapply(unique(cl$normalized$cluster), function(x){
+        gg <- unique(subset(cl$normalized, cluster == x, select = "genes")[,])
+        all.entrez[ symbol %in% gg]$ENTREZID
+        })
+    names(cmp_list) <- paste0(COI, "_PatGrp", unique(cl$normalized$cluster))
+
+   ## clusterProfiler ---------------
+    cpres2[[COI]] <- list()
+    
+    for(i in c("BP","MF","CC")){
+        cpres2[[COI]][[i]] <- clusterProfiler::compareCluster(cmp_list,
+            fun = "enrichGO", 
+            OrgDb = org.Hs.eg.db,
+            universe = unique(all.entrez$ENTREZID),
+            ont = i, pvalueCutoff = 0.05, 
+            pAdjustMethod = "BH", readable =TRUE) 
+    }
+}
+##!saveRDS(cpres2, file = paste0(data_dir, "clusterProfiler_DEGPatternGroups_AllTreats_HPCALabels.rds"))
+
+```
+
+```{r cache=FALSE}
+cpres2 <- readRDS(file = paste0(data_dir, "clusterProfiler_DEGPatternGroups_AllTreats_HPCALabels.rds"))
+```
+
+```{r message=FALSE, cache=FALSE}
+PL2 <- list()
+for(COI in names(cpres2)){
+    for(CAT in c("BP","MF","CC")){
+        p <- clusterProfiler::dotplot(cpres2[[COI]][[CAT]],
+            showCategory = 10)
+        p <- p +  ggtitle(paste(COI, ": Overrepresented GO", CAT, "terms")) + 
+            scale_color_gradientn(colours =rev(c("honeydew1","darkseagreen1",
+                "mediumspringgreen", "seagreen3","forestgreen")), limits = c(0, 0.05))
+    PL2[[COI]][[CAT]] <- p
+    }
+}
+```
+
+#### T cells
+
+```{r message=FALSE, fig.width = 30, fig.height = 6}
+PL2$T_cells$BP + PL2$T_cells$MF + PL2$T_cells$CC
+```
+
+#### NK cells
+
+```{r message=FALSE, fig.width = 32, fig.height = 8}
+PL2$NK_cell$BP + PL2$NK_cell$MF + PL2$NK_cell$CC
+```
+
+#### Monocytes
+
+```{r message=FALSE, fig.width = 34, fig.height = 8}
+PL2$Monocyte$BP + PL2$Monocyte$MF + PL2$Monocyte$CC
+```
+
+#### DC
+
+```{r message=FALSE, fig.width = 34, fig.height = 8}
+PL2$DC$BP + PL2$DC$MF + PL2$DC$CC
+```
+
+### IL15HOD vs IL15
+
+Here, we test which GO terms are enriched in genes that go (even further) up (or down) in the combi treatment vs. IL15 alone.
+
+```{r clusterProfiler_per_cellType, eval=FALSE}
+cpres <- list() ## list for storing ClusterProfiler results
+
+## universe of ENTREZ IDs
+all.entrez <-  clusterProfiler::bitr(rownames(sce), 
+    fromType="SYMBOL", toType="ENTREZID",
+    OrgDb="org.Hs.eg.db") %>%  as.data.table
+
+## for visualization purposes
+#logFClist <- lapply(de.combi_HPCA, function(x){
+ #   out <- x[, "logFC", drop=TRUE]
+ #   names(out) <- row.names(x)
+ #   return(out)
+
+## run ClusterProfiler =========================
+for(COI in c("T_cells","Monocyte","DC","NK_cell")){
+    ## generate list of ENTREZ IDs of interest
+    comp.list <- list()
+    comp.list[[paste0(COI, ".up")]] <- all.entrez[ SYMBOL %in% rownames(subset(de.combi_HPCA[[COI]], FDR <= 0.05 & logFC > 0))]$ENTREZID
+    comp.list[[paste0(COI, ".down")]] <- all.entrez[ SYMBOL %in% rownames(subset(de.combi_HPCA[[COI]], FDR <= 0.05 & logFC < 0))]$ENTREZID
+    
+    ## clusterProfiler ---------------
+    cpres[[COI]] <- list()
+    
+    for(i in c("BP","MF","CC")){
+        cpres[[COI]][[i]] <- clusterProfiler::compareCluster(comp.list,
+            fun = "enrichGO", 
+            OrgDb = org.Hs.eg.db,
+            universe = unique(all.entrez$ENTREZID),
+            ont = i, pvalueCutoff = 0.05, 
+            pAdjustMethod = "BH", readable =TRUE) 
+    }
+}
+##!saveRDS(cpres, file = paste0(data_dir, "clusterProfiler_upVsDown_IL15IL15HOD_HPCALabels.rds"))
+```
+
+```{r load_clusterProfiler_results, cache=FALSE}
+cpres <- readRDS( file = paste0(data_dir, "clusterProfiler_upVsDown_IL15IL15HOD_HPCALabels.rds"))
+```
+
+```{r message=FALSE, cache=FALSE}
+PL <- list()
+for(COI in names(cpres)){
+    for(CAT in c("BP","MF","CC")){
+        p <- clusterProfiler::dotplot(cpres[[COI]][[CAT]],
+            showCategory = 10)
+        p <- p +  ggtitle(paste(COI, ": Overrepresented GO", CAT, "terms"), 
+            subtitle = "IL15HOD / IL15 treatment") + 
+            scale_color_gradientn(colours =rev(c("honeydew1","darkseagreen1",
+                "mediumspringgreen", "seagreen3","forestgreen")), limits = c(0, 0.05))
+    PL[[COI]][[CAT]] <- p
+    }
+}
+```
+
+- up = up in IL15+HOD compared to IL15 alone
+
+#### Biological processes
+
+```{r message=FALSE, fig.width = 20, fig.height = 10}
+PL$T_cells$BP + PL$NK_cell$BP + PL$Monocyte$BP + PL$DC$BP
+```
+
+#### Molecular Functions
+
+```{r message=FALSE, fig.width = 20, fig.height = 10}
+PL$T_cells$MF + PL$NK_cell$MF + PL$Monocyte$MF + PL$DC$MF
+```
+
+#### Cellular compartments
+
+```{r message=FALSE, fig.width = 20, fig.height = 10}
+PL$T_cells$CC + PL$NK_cell$CC + PL$Monocyte$CC + PL$DC$CC
+```
+
+### MILO Nhood marker genes
+
+```{r clusterProfiler_per_Nhood, eval=FALSE}
+## universe of ENTREZ IDs
+all.entrez <-  clusterProfiler::bitr(rownames(sce), 
+    fromType="SYMBOL", toType="ENTREZID",
+    OrgDb="org.Hs.eg.db") %>%  as.data.table
+
+cl <- lapply(nhood_marks, function(x){
+    all.entrez[ SYMBOL %in% rownames(subset(x, FDR < 0.05 & summary.logFC > 0))]$ENTREZID
+})
+names(cl) <- paste0("Nhood", names(cl), ".up")
+
+## run ClusterProfiler =========================
+cpres <- list()
+for(i in c("BP","MF","CC")){
+        cpres[[i]] <- clusterProfiler::compareCluster(cl,
+            fun = "enrichGO", 
+            OrgDb = org.Hs.eg.db,
+            universe = unique(all.entrez$ENTREZID),
+            ont = i, pvalueCutoff = 0.05, 
+            pAdjustMethod = "BH", readable =TRUE) 
+}
+
+##!saveRDS(cpres, file = paste0(data_dir, "clusterProfiler_MILONhoodMarkers.rds"))
+```
+
+```{r load_clusterProfiler_results2, cache=FALSE}
+cpres <- readRDS( file = paste0(data_dir, "clusterProfiler_MILONhoodMarkers.rds"))
+```
+
+```{r message=FALSE, cache=FALSE}
+PL <- list()
+for(CAT in c("BP","MF","CC")){
+        p <- clusterProfiler::dotplot(cpres[[CAT]],
+            showCategory = 10)
+        p <- p +  ggtitle(paste("Overrepresented GO", CAT, "terms"), 
+            subtitle = "IL15HOD / IL15 treatment") + 
+            scale_color_gradientn(colours =rev(c("honeydew1","darkseagreen1",
+                "mediumspringgreen", "seagreen3","forestgreen")), limits = c(0, 0.05))
+    PL[[CAT]] <- p
+}
+
+```
+
+- up = up in the given MILO Neighborhood compared to the other Nhoods
+
+#### Biological processes
+
+```{r message=FALSE, fig.width = 16, fig.height = 10}
+PL$BP 
+```
+
+#### Molecular functions
+
+```{r message=FALSE, fig.width = 16, fig.height = 12}
+PL$MF 
+```
+
+#### Cellular compartments
+
+```{r message=FALSE, fig.width = 16, fig.height = 10}
+PL$CC 
+```
+
+
+----------------------------------------------------
+
+```{r SAVING_XLSX, eval=FALSE}
+#####################################
+## SAVING
+#####################################
+## save_DEGpatterns
+## from DMSO vs no-DMSO ------------------------------------------------------
+degsl <- lapply(c("T_cells","Monocyte","DC","NK_cell"), function(coi){
+    degres <- readRDS(file=paste0(data_dir, "degPatterns_HPCAlabels_", coi, ".rds"))
+    xx <- unique(degres$normalized[, c("genes","labPredict_HPCA","cluster")])
+    names(xx)[3] <- "group.DEGpattern"
+    return(xx)
+})
+names(degsl) <- c("T_cells","Monocyte","DC","NK_cell")
+names(degsl) <- paste(names(degsl), "_patterns")
+##!openxlsx::write.xlsx(degsl,  file = paste0(data_dir,"marker_gene_lists/DEG_ControlVsTreatments_HPCAlabels_ExprPatternGroups_2022-06.xlsx"))
+
+## de.treat_HPCA: effect of any treatment --------------------------------------
+markers.l <- lapply(de.treat_HPCA, function(x){
+    dt <- as.data.frame(x)
+    dt <- subset(dt, FDR <= 0.05)
+    dt$gene <- rownames(dt)
+    return(dt)})
+names(markers.l) <- paste0(names(markers.l), "_DMSO vs. no-DMSO")
+##!openxlsx::write.xlsx(markers.l,  file = paste0(data_dir,"marker_gene_lists/DEG_ControlVsTreatments_HPCALabels_2022-06.xlsx"))
+
+## de.combi_HPCA: effect of combi treatment compared to IL15 alone ------------
+markers.l <- lapply(de.combi_HPCA, function(x){
+    dt <- as.data.frame(x)
+    dt <- subset(dt, FDR <= 0.05)
+    dt$gene <- rownames(dt)
+    return(dt)})
+names(markers.l) <- paste0(names(markers.l), "_IL15 vs. IL15HOD")
+##!openxlsx::write.xlsx(markers.l,  file = paste0(data_dir,"marker_gene_lists/DEG_IL15-vs-IL15HOD_HPCALabels_2022-06.xlsx"))
+
+## markers of MILO Nhoods: comparing the Nhoods to each other
+
+markers.l <- lapply(nhood_marks, function(x){
+    dt <- as.data.frame(x)
+    dt <- subset(dt, FDR <= 0.05)
+    dt$gene <- rownames(dt)
+    return(dt)})
+names(markers.l) <- paste0("Nhood", names(markers.l))
+##!openxlsx::write.xlsx(markers.l,  file = paste0(data_dir,"marker_gene_lists/MILO-Nhood_markerGenes_2022-06.xlsx"))
+```
+
