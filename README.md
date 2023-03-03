@@ -1,6 +1,10 @@
 # Copertino et al.: The role of HODHbt for HIV CTL response in kick-and-kill approaches
 
 The repo here contains the code that was used for the data processing of human PBMC single-cell RNA-seq data.
+Code and methods were written by Friederike Duendar and Paul Zumbo at the [Applied Bioinformatics Core of Weill Cornell Medicine](https://abc.med.cornell.edu/).
+Don't hesitate to get in touch with questions via abc `at` med.cornell.edu
+
+![](WCM_MB_LOGO_HZSS1L_CLR_RGB.png)
 
 ## 5' scRNA-seq Library Preparation and Sequencing
 
