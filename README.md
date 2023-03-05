@@ -34,6 +34,10 @@ clusterProfiler v.3.10.1 (54).
 
 For more details, see the sessionInfo.txt file here.
 
+## DATA AVAILABILITY
+
+* the `SingleCellExperiment` object named "sce_Dennis_sampleIntegration_2022-05-03.rds" in the scripts here, can be downloaded [here](https://wcm.box.com/s/fyxztyy74hqp8kmh8lc9kz17s8pguih0).
+
 ## References
 
 47. Amezquita RA, Lun ATL, Becht E, Carey VJ, Carpp LN, Geistlinger L, Marini F, Rue-Albrecht K, Risso D, Soneson C, Waldron L, Pages H, Smith ML, Huber W, Morgan M, Gottardo R, Hicks SC. Publisher Correction: Orchestrating single-cell analysis with Bioconductor. Nat Methods. 2020;17(2):242. Epub 2019/12/13. doi: 10.1038/s41592-019-0700-8. PubMed PMID:
